@@ -25,9 +25,7 @@
   "pi": {
     "extensions": [
       "./plan-utils.ts",
-      "./execute-plan.ts",
-      "./permission-plan-mode.ts",
-      "./plannotator-permissions-enhancer.ts"
+      "./execute-plan.ts"
     ]
   },
   "peerDependencies": {

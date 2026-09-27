@@ -9,7 +9,7 @@ You are in **PLAN MODE** — read-only exploration. Do not edit or write files.
 3. **Diagnose** — run `lens_diagnostics` / `lsp_diagnostics` on affected files
 4. **Plan** — write structured steps with specific file references and line numbers
 5. **Save** — call `plan_save` with the full plan markdown (optional `cwd` to save plans outside the default `~/.pi/plans` tree)
-6. **Submit** — call `plan_submit` to open the review UI for human approval (or use the `annotate` alias to display and annotate markdown files)
+6. **Submit** — call `plan_submit` to open the plan for human review (or use the `annotate` alias to display and annotate markdown files). If the result begins with `Review opened in plannotator-tui`, end your turn immediately — the human's feedback arrives as the next user message. Otherwise act on the returned decision and feedback. The review backend is set by `planTools.reviewBackend` (`auto` | `tui` | `browser`) in the profile `settings.json`.
 
 ### Quality Checklist (before `plan_save`)
 

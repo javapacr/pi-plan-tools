@@ -1,7 +1,7 @@
 {
   "name": "pi-plan-tools",
   "version": "0.1.0",
-  "description": "Plan management, execution, and permission enforcement for pi — save/submit plans, execute approved plans in clean sessions, cycle permission modes, and enforce ask/plan/auto-approve rules",
+  "description": "Plan tools for pi: save plan markdown and open it for human review with Plannotator; also carries unloaded permission-mode source",
   "keywords": [
     "pi-package",
     "pi",
@@ -24,8 +24,7 @@
   },
   "pi": {
     "extensions": [
-      "./plan-utils.ts",
-      "./execute-plan.ts"
+      "./plan-utils.ts"
     ]
   },
   "peerDependencies": {

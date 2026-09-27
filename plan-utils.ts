@@ -4,12 +4,17 @@
  * Provides lean plan tools:
  *   plan_save   — saves plan markdown to ~/.pi/plans/<project>/<date>/<slug>.md
  *                 (or to a custom cwd directory)
- *   plan_submit — opens a file in plannotator browser UI (via CLI), waits for
- *                 approve/deny/feedback, returns the result to the LLM.
- *   annotate    — alias for plan_submit, used to display and annotate markdown
- *                 files (or any file plannotator can open).
+ *   plan_submit — opens a file for human review. Inside Herdr (see
+ *                 checkTuiPreconditions) it runs `plannotator-tui herdr open`
+ *                 and returns at once with text starting
+ *                 `Review opened in plannotator-tui`, telling the model to end
+ *                 its turn; the feedback arrives as the next user message.
+ *                 Otherwise it runs the Plannotator browser gate and returns
+ *                 the decision.
+ *   annotate    — alias for plan_submit.
+ *   Backend: planTools.reviewBackend (auto | tui | browser) in the profile settings.json, re-read per call.
  *
- * No heavy event wiring. No new-session logic. Just save → review → continue.
+ * No event wiring, no session hand-off, no dialogs.
  */
 
 import {
@@ -19,7 +24,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { execSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
@@ -28,6 +33,29 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 export default function planUtils(pi: ExtensionAPI): void {
+	// ── Types ─────────────────────────────────────────────────────────────────
+
+	type ReviewDetails = {
+		backend: "tui" | "browser";
+		approved?: boolean;
+		dismissed?: boolean;
+		feedback?: string;
+		paneId?: string;
+		filePath?: string;
+		fallbackReason?: string;
+	};
+	type ReviewResult = {
+		content: { type: "text"; text: string }[];
+		details: ReviewDetails | undefined;
+	};
+	type BackendChoice =
+		| { backend: "tui"; tuiBin: string }
+		| { backend: "browser"; fallbackReason?: string };
+
+	type ReviewBackendSetting = "auto" | "tui" | "browser";
+
+	const TUI_MARKER = "Review opened in plannotator-tui";
+
 	// ── Helpers ───────────────────────────────────────────────────────────────
 
 	const DEFAULT_PLANS_DIR = join(homedir(), ".pi", "plans");
@@ -74,9 +102,14 @@ export default function planUtils(pi: ExtensionAPI): void {
 		return resolve(base, inputPath);
 	}
 
-	function findPlannotator(): string | null {
+	function findBin(name: string): string | null {
 		try {
-			return execSync("which plannotator", { encoding: "utf-8" }).trim();
+			return (
+				execFileSync("which", [name], {
+					encoding: "utf-8",
+					stdio: ["ignore", "pipe", "ignore"],
+				}).trim() || null
+			);
 		} catch {
 			return null;
 		}
@@ -164,11 +197,13 @@ export default function planUtils(pi: ExtensionAPI): void {
 		name: "plan_submit",
 		label: "Submit Plan for Review",
 		description:
-			"Open a file in the Plannotator browser UI for human review. " +
-			"Blocks until the user approves, denies with feedback, or dismisses. " +
-			"Returns the decision and any feedback annotations.",
+			"Open a file for human review. Depending on configuration and environment, " +
+			"the review opens either in plannotator-tui inside a Herdr pane (returns " +
+			"immediately; follow the result and end your turn, the feedback arrives as " +
+			"the next user message) or in the Plannotator browser gate (blocks until the " +
+			"user approves, sends feedback, or dismisses). Act on the returned text.",
 		promptSnippet:
-			"Open plan in browser for approval → returns decision + feedback",
+			"Open a file for human review → TUI hand-off (end your turn) or browser decision + feedback",
 		parameters: {
 			type: "object" as const,
 			properties: {
@@ -204,10 +239,11 @@ export default function planUtils(pi: ExtensionAPI): void {
 		label: "Annotate File",
 		description:
 			"Display and annotate a markdown file (or any file plannotator can open) " +
-			"in the Plannotator browser UI. Alias for plan_submit; accepts the same " +
-			"filePath and optional cwd parameters.",
+			"for human review. Alias for plan_submit: same filePath and optional cwd " +
+			"parameters, same backends (plannotator-tui in a Herdr pane, or the " +
+			"Plannotator browser gate). Act on the returned text.",
 		promptSnippet:
-			"Display/annotate a file in browser → returns decision + feedback",
+			"Display/annotate a file for human review → TUI hand-off (end your turn) or browser decision + feedback",
 		parameters: {
 			type: "object" as const,
 			properties: {
@@ -242,7 +278,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 		inputPath: string,
 		cwdParam: string | undefined,
 		ctx: ExtensionContext,
-	) {
+	): Promise<ReviewResult> {
 		const trimmedPath = inputPath.trim();
 		if (!trimmedPath) {
 			return {
@@ -288,8 +324,200 @@ export default function planUtils(pi: ExtensionAPI): void {
 			};
 		}
 
+		const choice = chooseBackend(ctx);
+		let fallbackReason: string | undefined;
+		if (choice.backend === "tui") {
+			const tui = await runTuiReview(choice.tuiBin, fullPath);
+			if (tui.ok) return tui.result;
+			fallbackReason = tui.reason;
+		} else {
+			fallbackReason = choice.fallbackReason;
+		}
+		const browser = await runBrowserReview(fullPath, ctx);
+		return fallbackReason ? withFallbackNote(browser, fallbackReason) : browser;
+	}
+
+	// ── Backend selection ─────────────────────────────────────────────────────
+
+	function checkTuiPreconditions(
+		ctx: ExtensionContext,
+	): { ok: true; tuiBin: string } | { ok: false; reason: string } {
+		if (process.env.HERDR_ENV !== "1") {
+			return { ok: false, reason: "HERDR_ENV is not 1" };
+		}
+		if (!process.env.HERDR_PANE_ID?.trim()) {
+			return { ok: false, reason: "HERDR_PANE_ID is not set" };
+		}
+		if (process.env.PI_SUBAGENT_CHILD) {
+			return {
+				ok: false,
+				reason: "running as a subagent child (PI_SUBAGENT_CHILD is set)",
+			};
+		}
+		if (!ctx.hasUI) {
+			return { ok: false, reason: "no interactive UI (ctx.hasUI is false)" };
+		}
+		const tuiBin = findBin("plannotator-tui");
+		if (!tuiBin) {
+			return { ok: false, reason: "plannotator-tui not found on PATH" };
+		}
+		return { ok: true, tuiBin };
+	}
+
+	/** Profile settings.json path from PI_CODING_AGENT_DIR (pi-herdr-hooks pattern). */
+	function resolveSettingsPath(env: NodeJS.ProcessEnv = process.env): string {
+		const dir = env.PI_CODING_AGENT_DIR;
+		if (!dir) return join(homedir(), ".pi", "agent", "settings.json");
+		if (dir === "~") return join(homedir(), "settings.json");
+		if (dir.startsWith("~/"))
+			return join(homedir(), dir.slice(2), "settings.json");
+		return join(dir, "settings.json");
+	}
+
+	/** planTools.reviewBackend; missing file/block, bad JSON or unknown value ⇒ "auto". */
+	function readReviewBackend(): ReviewBackendSetting {
+		try {
+			const parsed: unknown = JSON.parse(
+				readFileSync(resolveSettingsPath(), "utf8"),
+			);
+			if (!isObject(parsed)) return "auto";
+			const planTools = parsed.planTools;
+			if (!isObject(planTools)) return "auto";
+			const value = planTools.reviewBackend;
+			return value === "auto" || value === "tui" || value === "browser"
+				? value
+				: "auto";
+		} catch {
+			return "auto";
+		}
+	}
+
+	function chooseBackend(ctx: ExtensionContext): BackendChoice {
+		// Backend from planTools.reviewBackend (re-read per call; invalid ⇒ auto).
+		const setting = readReviewBackend();
+		if (setting === "browser") return { backend: "browser" };
+		// "auto" and "tui" behave identically today (D10).
+		const pre = checkTuiPreconditions(ctx);
+		return pre.ok
+			? { backend: "tui", tuiBin: pre.tuiBin }
+			: { backend: "browser", fallbackReason: pre.reason };
+	}
+
+	function withFallbackNote(result: ReviewResult, reason: string): ReviewResult {
+		const [first, ...rest] = result.content;
+		const note = `plannotator-tui unavailable (${reason}); used the browser review instead.`;
+		const content = first
+			? [{ ...first, text: `${note}\n\n${first.text}` }, ...rest]
+			: [{ type: "text" as const, text: note }];
+		return {
+			content,
+			details: {
+				...(result.details ?? { backend: "browser" }),
+				fallbackReason: reason,
+			},
+		};
+	}
+
+	// ── plannotator-tui backend (Herdr) ───────────────────────────────────────
+
+	function firstNonEmptyLine(text: string): string | undefined {
+		return text
+			.split("\n")
+			.map((l) => l.trim())
+			.find((l) => l.length > 0);
+	}
+
+	function parseJson(text: string): unknown {
+		try {
+			return JSON.parse(text);
+		} catch {
+			return undefined;
+		}
+	}
+
+	function isObject(x: unknown): x is Record<string, unknown> {
+		return typeof x === "object" && x !== null && !Array.isArray(x);
+	}
+
+	function runTuiReview(
+		tuiBin: string,
+		fullPath: string,
+	): Promise<{ ok: true; result: ReviewResult } | { ok: false; reason: string }> {
+		return new Promise((res) => {
+			execFile(
+				tuiBin,
+				["herdr", "open", fullPath],
+				{ encoding: "utf-8", timeout: 15_000 },
+				(err, stdout, stderr) => {
+					if (err) {
+						if (err.killed) {
+							res({ ok: false, reason: "herdr open timed out after 15s" });
+							return;
+						}
+						const detail =
+							firstNonEmptyLine(String(stderr ?? "")) ??
+							(typeof err.code === "number"
+								? `exit code ${err.code}`
+								: (firstNonEmptyLine(err.message) ?? "unknown error"));
+						res({ ok: false, reason: `herdr open failed: ${detail}` });
+						return;
+					}
+
+					const out = String(stdout ?? "").trim();
+					let parsed = parseJson(out);
+					if (parsed === undefined) {
+						const lines = out
+							.split("\n")
+							.map((l) => l.trim())
+							.filter((l) => l.length > 0);
+						const last = lines[lines.length - 1];
+						if (last !== undefined) parsed = parseJson(last);
+					}
+					const result = isObject(parsed) ? parsed.result : undefined;
+					const pluginPane = isObject(result) ? result.plugin_pane : undefined;
+					if (!isObject(pluginPane)) {
+						res({ ok: false, reason: "herdr open returned unexpected output" });
+						return;
+					}
+
+					const pane = pluginPane.pane;
+					const nestedId = isObject(pane) ? pane.pane_id : undefined;
+					const paneId =
+						typeof nestedId === "string" && nestedId
+							? nestedId
+							: typeof pluginPane.pane_id === "string" && pluginPane.pane_id
+								? pluginPane.pane_id
+								: "unknown";
+
+					res({
+						ok: true,
+						result: {
+							content: [
+								{
+									type: "text",
+									text:
+										`${TUI_MARKER}: pane ${paneId}, file ${fullPath}.\n` +
+										"End your turn now. Do not wait, poll, or read the review pane. " +
+										"The human's feedback (or a go-ahead) arrives as the next user " +
+										"message; address every item, then continue.",
+								},
+							],
+							details: { backend: "tui", paneId, filePath: fullPath },
+						},
+					});
+				},
+			);
+		});
+	}
+
+	// ── Plannotator browser gate ──────────────────────────────────────────────
+
+	async function runBrowserReview(
+		fullPath: string,
+		ctx: ExtensionContext,
+	): Promise<ReviewResult> {
 		// Check plannotator CLI is available
-		const plannotatorBin = findPlannotator();
+		const plannotatorBin = findBin("plannotator");
 		if (!plannotatorBin) {
 			return {
 				content: [
@@ -298,7 +526,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 						text: "Error: `plannotator` CLI not found in PATH. Install it: curl -fsSL https://plannotator.ai/install.sh | bash",
 					},
 				],
-				details: undefined,
+				details: { backend: "browser" },
 			};
 		}
 
@@ -355,7 +583,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 							text: "Review dismissed. The user closed the review UI without taking action.",
 						},
 					],
-					details: { approved: false, dismissed: true } as any,
+					details: { backend: "browser", approved: false, dismissed: true },
 				};
 			}
 
@@ -372,57 +600,25 @@ export default function planUtils(pi: ExtensionAPI): void {
 							text: `Review feedback:\n\n${trimmed}\n\nRevise and resubmit.`,
 						},
 					],
-					details: { approved: false, feedback: trimmed } as any,
+					details: { backend: "browser", approved: false, feedback: trimmed },
 				};
 			}
 
 			if (decision.decision === "approved") {
-				// Ask the user how to proceed
-				const choice = await ctx.ui?.select?.(
-					"✅ Review approved — how do you want to proceed?",
-					[
-						"▶️  Same session — switch to build mode and continue here",
-						"🆕 New session — start a clean session with the file pre-seeded",
-					],
-				);
-
-				if (choice?.startsWith("🆕")) {
-					// New-session path: hand off to execute-plan.ts via event
-					pi.events.emit("plannotator:new-session-approved", {
-						filePath: fullPath,
-						planContent,
-					});
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text:
-									"✅ Review approved — new session selected. " +
-									"The editor has been pre-filled with /execute-plan. " +
-									"Press Enter to launch a clean session with the content pre-seeded.",
-							},
-						],
-						details: { approved: true, newSession: true } as any,
-					};
-				}
-
-				// Same-session path: emit mode-change event; content goes back to LLM via tool result
-				pi.events.emit("plannotator-wrapper:execute-same-session", {
-					planContent,
-					modeChangeOnly: true,
-				});
-				const hasTodos = /^[-*]\s+\[[ x]\]/m.test(planContent);
-				const doneHint = hasTodos
-					? "\n\nAfter completing each step, include [DONE:n] in your response where n is the step number."
-					: "";
+				const feedback =
+					typeof decision.feedback === "string" ? decision.feedback.trim() : "";
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `✅ Review approved! Build mode restored. Execute the plan steps in order. Use todos to track progress.${doneHint}\n\n## Approved Content\n\n${planContent}`,
+							text: feedback
+								? `Review approved. Feedback:\n\n${feedback}`
+								: "Review approved.",
 						},
 					],
-					details: { approved: true, sameSession: true } as any,
+					details: feedback
+						? { backend: "browser", approved: true, feedback }
+						: { backend: "browser", approved: true },
 				};
 			}
 
@@ -436,7 +632,11 @@ export default function planUtils(pi: ExtensionAPI): void {
 								"Revise based on the feedback above, save with plan_save, and submit again.",
 						},
 					],
-					details: { approved: false, feedback: decision.feedback } as any,
+					details: {
+						backend: "browser",
+						approved: false,
+						feedback: decision.feedback,
+					},
 				};
 			}
 
@@ -448,7 +648,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 						text: "Review dismissed without approval. Ask the user how to proceed.",
 					},
 				],
-				details: { approved: false, dismissed: true } as any,
+				details: { backend: "browser", approved: false, dismissed: true },
 			};
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : String(err);
@@ -460,7 +660,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 							text: "Review timed out (10 min). Ask the user to review.",
 						},
 					],
-					details: undefined,
+					details: { backend: "browser" },
 				};
 			}
 			return {
@@ -470,7 +670,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 						text: `Error opening review: ${msg}`,
 					},
 				],
-				details: undefined,
+				details: { backend: "browser" },
 			};
 		}
 	}

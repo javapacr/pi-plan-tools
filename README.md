@@ -1,8 +1,8 @@
 # pi-plan-tools
 
-Plan management, execution, and permission enforcement for [pi](https://github.com/earendil-works/pi-coding-agent) — save and submit plans for review, execute approved plans in clean sessions, cycle permission modes, and enforce ask/plan/auto-approve rules.
+Plan tools for [pi](https://github.com/earendil-works/pi-coding-agent) — save a plan and open it for human review with Plannotator. The repo also carries two unloaded permission-mode source files.
 
-This is a **multi-extension bundle** — four separate extensions packaged in a single npm module, covering the full plan lifecycle: write → review → approve → execute, with configurable permission enforcement throughout.
+The manifest (`package.json` `pi.extensions`) loads one extension, `plan-utils.ts`. `permission-plan-mode.ts` and `plannotator-permissions-enhancer.ts` are kept as source and are not loaded.
 
 ---
 
@@ -10,17 +10,16 @@ This is a **multi-extension bundle** — four separate extensions packaged in a 
 
 | Extension | Tool(s) | Command(s) | Lines | Description |
 |-----------|---------|------------|-------|-------------|
-| **plan-utils** | `plan_save`, `plan_submit`, `annotate` | — | 477 | Save plan markdown to disk and open it in the Plannotator browser UI for human review. |
-| **execute-plan** | — | `/execute-plan` | 153 | Launch a clean build-mode session with the approved plan pre-seeded after Plannotator approval. |
+| **plan-utils** | `plan_save`, `plan_submit`, `annotate` | — | 677 | Save plan markdown to disk and open it for human review: plannotator-tui in a Herdr pane (returns at once; feedback arrives as the next user message) or the Plannotator browser gate. |
 | **permission-plan-mode** | — | `/permissions` | 1,369 | Shift+Tab mode cycling (bypass / plan / ask) with Claude Code-style allow/deny pattern rules. |
 | **plannotator-permissions-enhancer** | `plannotator_exit_plan` | — | 273 | Exit plan mode and return to build mode — bridges Plannotator approval with permission state. |
 
 ### Key Design Principles
 
-- **Full plan lifecycle** — Write a plan → submit for human review → get approval → execute in a clean session. Each stage is a separate extension that can be used independently.
-- **Human-in-the-loop** — `plan_submit` blocks until the user approves, denies with feedback, or dismisses. No autonomous execution without explicit approval.
+- **Plan → review** — Write a plan (`plan_save`), then open it for human review (`plan_submit` / `annotate`). The reviewer's feedback reaches the agent, and the caller decides what happens next.
+- **Human-in-the-loop** — Inside Herdr, `plan_submit` / `annotate` open plannotator-tui in a pane and return at once with an instruction to end the turn; the human's feedback arrives as the next user message. Elsewhere they run the Plannotator browser gate, which blocks until the user approves, sends feedback, or dismisses, and returns a plain result.
 - **Configurable permission enforcement** — Three modes (bypass, plan, ask) cycle via Shift+Tab. Ask mode uses Claude Code-style allow/deny rules for fine-grained tool control.
-- **Cross-extension coordination** — The plannotator-permissions-enhancer listens for mode-change events from permission-plan-mode and emits mode-switch events to exit plan mode when a plan is approved.
+- **Cross-extension coordination** — The plannotator-permissions-enhancer listens for mode-change events from permission-plan-mode and emits mode-switch events when `plannotator_exit_plan` is called.
 
 ---
 
@@ -39,7 +38,25 @@ Or reference directly in your `settings.json`:
 }
 ```
 
-All four extensions in the bundle are registered automatically — no need to configure individual files.
+Only `plan-utils.ts` is registered; the two permission files are unloaded source.
+
+---
+
+## Configuration
+
+`plan_submit` / `annotate` pick their review backend from `planTools.reviewBackend` in the profile `settings.json` (`$PI_CODING_AGENT_DIR/settings.json`; `~/.pi/agent/settings.json` when `PI_CODING_AGENT_DIR` is unset). The file is re-read on every call.
+
+```json
+{ "planTools": { "reviewBackend": "auto" } }
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | Open plannotator-tui in a Herdr pane when every precondition holds (`HERDR_ENV=1`, `HERDR_PANE_ID` set, `plannotator-tui` on `PATH`, interactive UI, not a subagent child); otherwise run the browser gate and prefix the result with `plannotator-tui unavailable (<reason>); used the browser review instead.` |
+| `tui` | Same as `auto` today (reserved for a future stricter mode). |
+| `browser` | Always run the Plannotator browser gate (`plannotator annotate <file> --gate --json`); no TUI attempt, no note. |
+
+A missing file, missing `planTools` block, malformed JSON, or unknown value means `auto`.
 
 ---
 
@@ -61,7 +78,17 @@ Write a plan to `~/.pi/plans/<project>/<date>/<slug>.md` by default, or to `<cwd
 
 #### `plan_submit` Tool
 
-Open a file in the Plannotator browser UI for human review. Blocks until the user approves, denies with feedback, or dismisses. Returns the decision and any feedback annotations.
+Open a file for human review. The backend is chosen per call from `planTools.reviewBackend` (see [Configuration](#configuration)) and the environment:
+
+- **plannotator-tui (Herdr)** — used when `HERDR_ENV=1`, `HERDR_PANE_ID` is set, `plannotator-tui` is on `PATH`, the session has an interactive UI, and it is not a pi-subagents child (`PI_SUBAGENT_CHILD` unset). Runs `plannotator-tui herdr open <abs-path>` (placement from `~/.config/plannotator-tui/config.toml`) and returns immediately with:
+
+  ```text
+  Review opened in plannotator-tui: pane <pane-id>, file <abs-path>.
+  End your turn now. Do not wait, poll, or read the review pane. The human's feedback (or a go-ahead) arrives as the next user message; address every item, then continue.
+  ```
+
+  `details` are `{ backend: "tui", paneId, filePath }`.
+- **Plannotator browser gate** — when `planTools.reviewBackend` is `browser`, or when the TUI can't be used. Runs `plannotator annotate <file> --gate --json` and blocks until the user approves (`Review approved.`, plus any feedback), sends feedback, or dismisses. When the TUI could not be used, the result starts with `plannotator-tui unavailable (<reason>); used the browser review instead.` `details` carry `backend: "browser"` and, on fallback, `fallbackReason`.
 
 **Parameters:**
 
@@ -72,21 +99,7 @@ Open a file in the Plannotator browser UI for human review. Blocks until the use
 
 #### `annotate` Tool
 
-Alias for `plan_submit` — display and annotate markdown files (or any file Plannotator can open) in the browser UI.
-
-### Plan Execution (execute-plan.ts)
-
-#### `/execute-plan` Command
-
-Start a clean new build-mode session with the approved plan pre-seeded. Automatically triggered after plan approval (editor pre-filled with `/execute-plan`). Can also be typed manually after approving a plan.
-
-**Post-approval flow:**
-
-1. `plan_submit` emits `plannotator:new-session-approved` synchronously.
-2. The event listener stores `filePath` + `planContent` in `pendingSession`.
-3. A `ui.select` prompt asks the user: new session or same session.
-4. **New session** — Editor is pre-filled with `/execute-plan`; user presses Enter → the command handler fires → `launchPlanSession()` starts the new session.
-5. **Same session** — `plannotator-wrapper:execute-same-session` is emitted for in-session execution.
+Alias for `plan_submit` — same parameters, same backends and results; use it to display and annotate markdown files (or any file Plannotator can open).
 
 ### Permission Enforcement (permission-plan-mode.ts)
 
@@ -117,7 +130,7 @@ Rules support prefix matching (`:*`), wildcard (`*`), and per-tool granularity (
 
 #### `plannotator_exit_plan` Tool
 
-Exit plan mode and return to build mode with full tool access. Use this for a same-session exit (e.g. the user asks to stop planning). When `plan_submit` is approved, the extension automatically exits plan mode — no manual call needed.
+Exit plan mode and return to build mode with full tool access. Use this for a same-session exit (e.g. the user asks to stop planning). `plan_submit` approval does not exit plan mode; call this tool explicitly.
 
 **Parameters:**
 
@@ -131,46 +144,42 @@ Exit plan mode and return to build mode with full tool access. Use this for a sa
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                          pi-plan-tools                             │
-│                                                                    │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐ │
-│  │  plan-utils.ts  │  │  execute-plan.ts │  │ permission-      │ │
-│  │                 │  │                  │  │ plan-mode.ts     │ │
-│  │  plan_save ─────┼──┼─▶ /execute-plan  │  │                  │ │
-│  │  plan_submit    │  │  launches clean  │  │  Shift+Tab mode  │ │
-│  │  annotate       │  │  session with    │  │  cycling:        │ │
-│  │       │         │  │  plan pre-seeded │  │  bypass → plan   │ │
-│  │       ▼         │  │                  │  │  → ask           │ │
-│  │  Plannotator    │  │  Post-approval:  │  │                  │ │
-│  │  browser UI     │  │  event listener  │  │  Ask rules from  │ │
-│  │  (approve/deny) │  │  stores plan,    │  │  permissions.json│ │
-│  │       │         │  │  ui.select →     │  │                  │ │
-│  │       ▼         │  │  new vs same     │  │  /permissions    │ │
-│  │  approve event  │  │  session         │  │  command         │ │
-│  └────────┬────────┘  └──────────────────┘  └────────┬─────────┘ │
-│           │                                           │           │
-│           │     ┌──────────────────────────┐          │           │
-│           └────▶│  plannotator-            │◀─────────┘           │
-│                 │  permissions-enhancer.ts │                      │
-│                 │                          │                      │
-│                 │  plannotator_exit_plan   │                      │
-│                 │  exits plan mode →       │                      │
-│                 │  build mode              │                      │
-│                 └──────────────────────────┘                      │
-│                                                                    │
-│  Tools:  plan_save / plan_submit / annotate / plannotator_exit_plan│
-│  Cmds:   /execute-plan / /permissions                              │
+│                          pi-plan-tools                           │
+│                                                                  │
+│  ┌──────────────────────────┐    ┌────────────────────────────┐  │
+│  │  plan-utils.ts           │    │  permission-plan-mode.ts   │  │
+│  │                          │    │  (unloaded source)         │  │
+│  │  plan_save               │    │                            │  │
+│  │  plan_submit             │    │  Shift+Tab mode cycling:   │  │
+│  │  annotate                │    │  bypass → plan → ask       │  │
+│  │       │                  │    │                            │  │
+│  │       ▼                  │    │  Ask rules from            │  │
+│  │  plannotator-tui pane    │    │  permissions.json          │  │
+│  │  (Herdr) or Plannotator  │    │                            │  │
+│  │  browser gate            │    │  /permissions command      │  │
+│  └──────────────────────────┘    └─────────────┬──────────────┘  │
+│                                                │                 │
+│                 ┌──────────────────────────┐   │                 │
+│                 │  plannotator-            │◀──┘                 │
+│                 │  permissions-enhancer.ts │                     │
+│                 │  (unloaded source)       │                     │
+│                 │                          │                     │
+│                 │  plannotator_exit_plan   │                     │
+│                 │  exits plan mode →       │                     │
+│                 │  build mode              │                     │
+│                 └──────────────────────────┘                     │
+│                                                                  │
+│  Tools:  plan_save / plan_submit / annotate                      │
+│  Cmds:   /permissions (unloaded source)                          │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Cross-Extension Event Flow
 
-The four extensions coordinate via pi's event bus:
+The two permission source files coordinate via pi's event bus (neither is loaded by the manifest):
 
 | Event | Emitter | Listener | Purpose |
 |-------|---------|----------|---------|
-| `plannotator:new-session-approved` | `plan_submit` | `execute-plan` | Triggers plan storage + session prompt |
-| `plannotator-wrapper:plan-approved` | `execute-plan` | `@plannotator/pi-extension` | Suppresses in-place continueWhenIdle fallback |
 | `pi-claude-permissions:set-mode` | `plannotator_exit_plan` | `permission-plan-mode` | Switches mode (e.g. plan → bypass) |
 | `pi-claude-permissions:mode-changed` | `permission-plan-mode` | `plannotator-permissions-enhancer` | Tracks current mode state |
 

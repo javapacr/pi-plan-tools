@@ -4,7 +4,8 @@
  * Provides lean plan tools:
  *   plan_save   — saves plan markdown to ~/.pi/plans/<project>/<date>/<slug>.md
  *                 (or to a custom cwd directory)
- *   plan_submit — opens a file for human review. Inside Herdr (see
+ *   plan_submit — opens a file, or a folder of Markdown files, for human
+ *                 review. Inside Herdr (see
  *                 checkTuiPreconditions) it runs `plannotator-tui herdr open`
  *                 and returns at once with text starting
  *                 `Review opened in plannotator-tui`, telling the model to end
@@ -18,15 +19,17 @@
  */
 
 import {
+	type Dirent,
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	readdirSync,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -42,6 +45,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 		feedback?: string;
 		paneId?: string;
 		filePath?: string;
+		isFolder?: boolean;
 		fallbackReason?: string;
 	};
 	type ReviewResult = {
@@ -100,6 +104,30 @@ export default function planUtils(pi: ExtensionAPI): void {
 	): string {
 		const base = cwdParam ? resolve(ctxCwd, cwdParam) : ctxCwd;
 		return resolve(base, inputPath);
+	}
+
+	const MARKDOWN_EXT = /\.(md|mdx|markdown)$/i;
+
+	/**
+	 * True when `dir` holds a Markdown file within `depth` levels below it.
+	 * Dot-prefixed subfolders are skipped, matching the folder view's default tree.
+	 */
+	function hasMarkdown(dir: string, depth: number): boolean {
+		let entries: Dirent[];
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return false;
+		}
+		if (entries.some((e) => e.isFile() && MARKDOWN_EXT.test(e.name)))
+			return true;
+		if (depth <= 0) return false;
+		return entries.some(
+			(e) =>
+				e.isDirectory() &&
+				!e.name.startsWith(".") &&
+				hasMarkdown(join(dir, e.name), depth - 1),
+		);
 	}
 
 	function findBin(name: string): string | null {
@@ -197,20 +225,22 @@ export default function planUtils(pi: ExtensionAPI): void {
 		name: "plan_submit",
 		label: "Submit Plan for Review",
 		description:
-			"Open a file for human review. Depending on configuration and environment, " +
+			"Open a file, or a folder of Markdown files, for human review. A folder opens " +
+			"with a file tree and yields one combined review across its files. " +
+			"Depending on configuration and environment, " +
 			"the review opens either in plannotator-tui inside a Herdr pane (returns " +
 			"immediately; follow the result and end your turn, the feedback arrives as " +
 			"the next user message) or in the Plannotator browser gate (blocks until the " +
 			"user approves, sends feedback, or dismisses). Act on the returned text.",
 		promptSnippet:
-			"Open a file for human review → TUI hand-off (end your turn) or browser decision + feedback",
+			"Open a file or folder for human review → TUI hand-off (end your turn) or browser decision + feedback",
 		parameters: {
 			type: "object" as const,
 			properties: {
 				filePath: {
 					type: "string",
 					description:
-						"Path to the file to review. Absolute paths are used as-is; " +
+						"Path to the file, or folder of Markdown files, to review. Absolute paths are used as-is; " +
 						"relative paths are resolved against cwd (or ctx.cwd if cwd is omitted).",
 				},
 				cwd: {
@@ -238,19 +268,20 @@ export default function planUtils(pi: ExtensionAPI): void {
 		name: "annotate",
 		label: "Annotate File",
 		description:
-			"Display and annotate a markdown file (or any file plannotator can open) " +
+			"Display and annotate a markdown file (or any file plannotator can open), " +
+			"or a folder of Markdown files as one combined review, " +
 			"for human review. Alias for plan_submit: same filePath and optional cwd " +
 			"parameters, same backends (plannotator-tui in a Herdr pane, or the " +
 			"Plannotator browser gate). Act on the returned text.",
 		promptSnippet:
-			"Display/annotate a file for human review → TUI hand-off (end your turn) or browser decision + feedback",
+			"Display/annotate a file or folder for human review → TUI hand-off (end your turn) or browser decision + feedback",
 		parameters: {
 			type: "object" as const,
 			properties: {
 				filePath: {
 					type: "string",
 					description:
-						"Path to the file to annotate. Absolute paths are used as-is; " +
+						"Path to the file, or folder of Markdown files, to annotate. Absolute paths are used as-is; " +
 						"relative paths are resolved against cwd (or ctx.cwd if cwd is omitted).",
 				},
 				cwd: {
@@ -291,14 +322,17 @@ export default function planUtils(pi: ExtensionAPI): void {
 
 		const fullPath = resolveWorkingPath(trimmedPath, ctx.cwd, cwdParam);
 
-		// Validate file exists and is readable
+		// Validate the path exists and is a regular file or a folder
+		let isFolder: boolean;
 		try {
-			if (!statSync(fullPath).isFile()) {
+			const st = statSync(fullPath);
+			isFolder = st.isDirectory();
+			if (!isFolder && !st.isFile()) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Error: ${fullPath} is not a regular file.`,
+							text: `Error: ${fullPath} is not a regular file or folder.`,
 						},
 					],
 					details: undefined,
@@ -316,24 +350,38 @@ export default function planUtils(pi: ExtensionAPI): void {
 			};
 		}
 
-		const planContent = readFileSync(fullPath, "utf-8").trim();
-		if (!planContent) {
-			return {
-				content: [{ type: "text" as const, text: "Error: file is empty." }],
-				details: undefined,
-			};
+		if (isFolder) {
+			if (!hasMarkdown(fullPath, 2)) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Error: folder ${fullPath} has no Markdown files within two levels.`,
+						},
+					],
+					details: undefined,
+				};
+			}
+		} else {
+			const planContent = readFileSync(fullPath, "utf-8").trim();
+			if (!planContent) {
+				return {
+					content: [{ type: "text" as const, text: "Error: file is empty." }],
+					details: undefined,
+				};
+			}
 		}
 
 		const choice = chooseBackend(ctx);
 		let fallbackReason: string | undefined;
 		if (choice.backend === "tui") {
-			const tui = await runTuiReview(choice.tuiBin, fullPath);
+			const tui = await runTuiReview(choice.tuiBin, fullPath, isFolder);
 			if (tui.ok) return tui.result;
 			fallbackReason = tui.reason;
 		} else {
 			fallbackReason = choice.fallbackReason;
 		}
-		const browser = await runBrowserReview(fullPath, ctx);
+		const browser = await runBrowserReview(fullPath, isFolder, ctx);
 		return fallbackReason ? withFallbackNote(browser, fallbackReason) : browser;
 	}
 
@@ -442,6 +490,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 	function runTuiReview(
 		tuiBin: string,
 		fullPath: string,
+		isFolder: boolean,
 	): Promise<{ ok: true; result: ReviewResult } | { ok: false; reason: string }> {
 		return new Promise((res) => {
 			execFile(
@@ -496,13 +545,15 @@ export default function planUtils(pi: ExtensionAPI): void {
 								{
 									type: "text",
 									text:
-										`${TUI_MARKER}: pane ${paneId}, file ${fullPath}.\n` +
+										`${TUI_MARKER}: pane ${paneId}, ${isFolder ? "folder" : "file"} ${fullPath}.\n` +
 										"End your turn now. Do not wait, poll, or read the review pane. " +
 										"The human's feedback (or a go-ahead) arrives as the next user " +
 										"message; address every item, then continue.",
 								},
 							],
-							details: { backend: "tui", paneId, filePath: fullPath },
+							details: isFolder
+								? { backend: "tui", paneId, filePath: fullPath, isFolder }
+								: { backend: "tui", paneId, filePath: fullPath },
 						},
 					});
 				},
@@ -514,6 +565,7 @@ export default function planUtils(pi: ExtensionAPI): void {
 
 	async function runBrowserReview(
 		fullPath: string,
+		isFolder: boolean,
 		ctx: ExtensionContext,
 	): Promise<ReviewResult> {
 		// Check plannotator CLI is available
@@ -531,13 +583,19 @@ export default function planUtils(pi: ExtensionAPI): void {
 		}
 
 		// Open plan in plannotator browser UI with annotate --gate (shows Approve + Send Feedback)
-		ctx.ui?.notify("Opening file in browser for review...", "info");
+		ctx.ui?.notify(
+			`Opening ${isFolder ? "folder" : "file"} in browser for review...`,
+			"info",
+		);
+		// `plannotator annotate` spells a folder argument as `folder/`.
+		const target =
+			isFolder && !fullPath.endsWith(sep) ? `${fullPath}${sep}` : fullPath;
 
 		try {
 			const output = await new Promise<string>((res, rej) => {
 				const child = spawn(
 					plannotatorBin,
-					["annotate", fullPath, "--gate", "--json"],
+					["annotate", target, "--gate", "--json"],
 					{
 						stdio: ["pipe", "pipe", "pipe"],
 					},
